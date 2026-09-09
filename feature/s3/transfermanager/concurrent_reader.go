@@ -106,7 +106,41 @@ func (r *concurrentReader) Read(p []byte) (int, error) {
 	}
 
 	close(ch)
-	r.wg.Wait()
+
+	// When partRead's replay loop fills the caller's buffer from already-buffered
+	// parts and returns via the quick exit, the consumer goroutine has finished but
+	// no goroutine is left receiving from r.ch. Download workers that finish after
+	// that point block forever trying to send into a full r.ch while Read waits on
+	// r.wg — a permanent, non-cancelable deadlock (#3552). Drain the results that
+	// are still outstanding into r.buf so the workers can finish and the data
+	// remains available to subsequent Read calls. Only the quick-exit path needs
+	// this: on the normal completion path the consumer is still draining r.ch, and
+	// on the error path r.ch is closed below.
+	if r.getDone() && r.getErr() == nil {
+		outstanding := r.index - r.receiveCount
+		if outstanding > 0 {
+			var drain sync.WaitGroup
+			drain.Add(1)
+			go func() {
+				defer drain.Done()
+				for i := int32(0); i < outstanding; i++ {
+					oc, ok := <-r.ch
+					if !ok {
+						return
+					}
+					r.receiveCount++
+					r.buf[oc.index] = &oc
+					r.buffered += oc.length
+				}
+			}()
+			r.wg.Wait()
+			drain.Wait()
+		} else {
+			r.wg.Wait()
+		}
+	} else {
+		r.wg.Wait()
+	}
 
 	if e := r.getErr(); e != nil && e != io.EOF {
 		close(r.ch)

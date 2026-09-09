@@ -424,3 +424,83 @@ func TestConcurrentReaderPartMemoryThrottleNoDeadlock(t *testing.T) {
 		t.Fatalf("expect %d bytes equal to assembled parts, got %d", len(expect), len(got))
 	}
 }
+
+// TestConcurrentReaderPartSmallChunkReadsNoDeadlock guards against the parts-mode
+// deadlock reported in #3552: when the caller reads in fixed chunks smaller than a
+// part (and the part size is an exact multiple of the chunk size), partRead's replay
+// loop fills the caller's buffer from previously downloaded parts and returns via the
+// quick exit without ever running the receive loop that drains r.ch. Download workers
+// that finish after that point block forever sending into a full r.ch while Read waits
+// on r.wg — a permanent, non-cancelable hang. The fix drains the outstanding results
+// into r.buf so the workers finish and the data remains available to later reads.
+func TestConcurrentReaderPartSmallChunkReadsNoDeadlock(t *testing.T) {
+	const (
+		partSize   = 8
+		partsCount = 12
+		readSize   = 2 // divides partSize evenly, so the quick exit fires on every Read
+	)
+	partsData := make([][]byte, partsCount)
+	var expect []byte
+	for i := int32(0); i < partsCount; i++ {
+		b := bytes.Repeat([]byte{byte('a' + i)}, partSize)
+		partsData[i] = b
+		expect = append(expect, b...)
+	}
+
+	s3Client := &s3testing.TransferManagerLoggingClient{}
+	s3Client.GetObjectFn = s3testing.ReaderPartGetObjectFn
+	s3Client.PartsData = partsData
+	s3Client.PartsCount = partsCount
+	s3Client.Data = expect
+
+	bufferThreshold := int64(partSize * 6)
+	sectionParts := int32(bufferThreshold / partSize) // 6 > Concurrency below
+
+	r := &concurrentReader{
+		partSize:        partSize,
+		partsCount:      partsCount,
+		sectionParts:    sectionParts,
+		getType:         types.GetObjectParts,
+		bufferThreshold: bufferThreshold,
+		options: Options{
+			GetObjectType: types.GetObjectParts,
+			Concurrency:   2, // r.ch capacity; partsCount >= sectionParts + Concurrency + 1
+			S3:            s3Client,
+		},
+		in:         &GetObjectInput{Bucket: aws.String("bucket"), Key: aws.String("key")},
+		capacity:   sectionParts,
+		buf:        make(map[int32]*outChunk),
+		ctx:        context.Background(),
+		ch:         make(chan outChunk, 2),
+		totalBytes: int64(len(expect)),
+	}
+
+	var got []byte
+	done := make(chan struct{})
+	var readErr error
+	go func() {
+		defer close(done)
+		buf := make([]byte, readSize)
+		for {
+			n, err := r.Read(buf)
+			got = append(got, buf[:n]...)
+			if err != nil {
+				readErr = err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Read deadlocked: download workers blocked sending to a full r.ch after partRead's quick-exit replay return")
+	}
+
+	if readErr != nil && readErr != io.EOF {
+		t.Fatalf("unexpected read error: %v", readErr)
+	}
+	if !bytes.Equal(expect, got) {
+		t.Fatalf("expect %d bytes equal to assembled parts, got %d", len(expect), len(got))
+	}
+}
